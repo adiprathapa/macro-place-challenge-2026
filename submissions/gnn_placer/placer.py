@@ -35,7 +35,7 @@ from macro_place.loader import load_benchmark_from_dir, load_benchmark
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-NUM_RESTARTS = 5           # GNN initialization restarts (reduced — GNN is only for init)
+NUM_RESTARTS = 8           # GNN initialization restarts (more = better init)
 GNN_EPOCHS = 150           # Gradient steps per GNN restart
 GNN_HIDDEN_DIM = 48        # GNN hidden dimension
 GNN_LAYERS = 4             # Number of GNN message-passing layers
@@ -114,7 +114,7 @@ class GNNPlacer:
         best_gnn_positions = None
         best_gnn_cost = float('inf')
 
-        time_for_gnn = min(TOTAL_TIME_LIMIT * 0.05, 180)  # 5% or 3 min max
+        time_for_gnn = min(TOTAL_TIME_LIMIT * 0.12, 400)  # 12% or ~7 min max
 
         for restart in range(NUM_RESTARTS):
             if time.time() - start_time > time_for_gnn:
@@ -162,7 +162,7 @@ class GNNPlacer:
 
         # ── Step 3: Electrostatic force-directed optimization ──────────
         remaining = TOTAL_TIME_LIMIT - (time.time() - start_time)
-        eplace_time = min(remaining * 0.15, 450)
+        eplace_time = min(remaining * 0.05, 120)  # ePlace is fast, ~30s
 
         if eplace_time > 10:
             t0 = time.time()
@@ -204,7 +204,7 @@ class GNNPlacer:
         # ── Step 5: Fast SA refinement (HPWL-based, numpy) ────────────
         remaining_time = TOTAL_TIME_LIMIT - (time.time() - start_time)
         if remaining_time > 60 and plc is not None and ov['overlap_count'] == 0:
-            sa_time = min(SA_TIME_LIMIT, remaining_time * 0.02)
+            sa_time = min(SA_TIME_LIMIT, remaining_time * 0.05)  # More SA time
             t0 = time.time()
             legal_positions = sa_refine(
                 legal_positions, benchmark, compute_proxy_cost,

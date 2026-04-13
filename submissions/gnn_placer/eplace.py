@@ -14,7 +14,7 @@ import torch
 import math
 import time
 
-from losses import wirelength_loss, overlap_loss, density_loss, spreading_loss, total_loss
+from losses import total_loss
 
 
 class ElectrostaticOptimizer:
@@ -51,14 +51,12 @@ class ElectrostaticOptimizer:
 
     def optimize(self, init_positions, num_iters=800, time_limit=600.0):
         """
-        Two-phase Adam optimization on macro positions.
+        Adam optimization on macro positions using total_loss.
 
-        Phase 1 (80%): Use the proven total_loss (same as GNN training) but
-        optimize positions directly. This gives the same quality of loss
-        gradients but with 4-5x more iterations than the GNN approach.
-
-        Phase 2 (20%): Fine-grid density + strong overlap penalty to prepare
-        for legalization.
+        Directly optimizes positions with the same proven loss function as
+        GNN training (wirelength + density + overlap + spreading with
+        annealing schedule), but bypasses the neural network for 4-5x more
+        iterations in the same time budget.
 
         Args:
             init_positions: [num_macros, 2] from GNN initialization
@@ -88,7 +86,6 @@ class ElectrostaticOptimizer:
             optimizer, T_max=num_iters, eta_min=lr * 0.02
         )
 
-        phase1_iters = int(num_iters * 0.8)
         best_positions = positions.detach().clone()
         best_score = float('inf')
         final_it = 0
@@ -100,26 +97,10 @@ class ElectrostaticOptimizer:
 
             optimizer.zero_grad()
 
-            if it < phase1_iters:
-                # Phase 1: Use proven total_loss (same as GNN training)
-                loss, ld = total_loss(
-                    positions, self.graph, self.benchmark,
-                    epoch=it, max_epochs=phase1_iters,
-                )
-            else:
-                # Phase 2: Fine-grid density + strong overlap
-                t2 = (it - phase1_iters) / max(num_iters - phase1_iters - 1, 1)
-                gamma = 10.0 + t2 * 10.0
-
-                wl = wirelength_loss(positions, self.graph, self.benchmark, gamma=gamma)
-                den = density_loss(positions, self.benchmark, grid_size=24)
-                ov = overlap_loss(positions, self.benchmark)
-
-                w_ov = 50.0 + t2 * 150.0  # 50 -> 200
-                loss = wl / canvas_area + 5.0 * den + w_ov * ov / canvas_area
-                ld = {'wirelength': (wl / canvas_area).item(),
-                      'density': den.item(),
-                      'overlap': (ov / canvas_area).item()}
+            loss, ld = total_loss(
+                positions, self.graph, self.benchmark,
+                epoch=it, max_epochs=num_iters,
+            )
 
             loss.backward()
 
@@ -149,12 +130,11 @@ class ElectrostaticOptimizer:
 
             # Logging
             if it == 0 or (it + 1) % 100 == 0 or it == num_iters - 1:
-                phase = "P1" if it < phase1_iters else "P2"
                 elapsed = time.time() - start
-                print(f"      ePlace iter {it+1}/{num_iters} [{phase}]: "
-                      f"wl={ld.get('wirelength', 0):.6f} "
-                      f"den={ld.get('density', 0):.4f} "
-                      f"ov={ld.get('overlap', 0):.6f} "
+                print(f"      ePlace iter {it+1}/{num_iters}: "
+                      f"wl={wl_val:.6f} "
+                      f"den={den_val:.4f} "
+                      f"ov={ov_val:.6f} "
                       f"[{elapsed:.1f}s]", flush=True)
 
         elapsed = time.time() - start

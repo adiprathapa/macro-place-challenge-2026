@@ -153,6 +153,41 @@ def legalize(
     return legal
 
 
+def _hpwl_delta(idx, old_x, old_y, new_x, new_y, positions, macro_nets, benchmark):
+    """
+    Compute change in HPWL if macro idx moves from (old_x,old_y) to (new_x,new_y).
+    Negative means improvement. Only considers nets connected to this macro.
+    """
+    num_macros = benchmark.num_macros
+    port_pos = benchmark.port_positions
+    delta = 0.0
+    for net_idx in macro_nets[idx]:
+        nodes = benchmark.net_nodes[net_idx].tolist()
+        old_min_x = old_max_x = old_x
+        old_min_y = old_max_y = old_y
+        new_min_x = new_max_x = new_x
+        new_min_y = new_max_y = new_y
+        for n in nodes:
+            if n == idx:
+                continue
+            if n < num_macros:
+                px = positions[n, 0].item()
+                py = positions[n, 1].item()
+            elif n < num_macros + port_pos.size(0):
+                px = port_pos[n - num_macros, 0].item()
+                py = port_pos[n - num_macros, 1].item()
+            else:
+                continue
+            old_min_x = min(old_min_x, px); old_max_x = max(old_max_x, px)
+            old_min_y = min(old_min_y, py); old_max_y = max(old_max_y, py)
+            new_min_x = min(new_min_x, px); new_max_x = max(new_max_x, px)
+            new_min_y = min(new_min_y, py); new_max_y = max(new_max_y, py)
+        old_hpwl = (old_max_x - old_min_x) + (old_max_y - old_min_y)
+        new_hpwl = (new_max_x - new_min_x) + (new_max_y - new_min_y)
+        delta += new_hpwl - old_hpwl
+    return delta
+
+
 def coordinate_descent_refine(
     positions: torch.Tensor,
     benchmark,
@@ -163,8 +198,9 @@ def coordinate_descent_refine(
 ) -> torch.Tensor:
     """
     Coordinate descent: for each macro, try multiple candidate positions
-    (median of connected pins, random perturbations, weighted centroid)
-    and keep the best improvement.
+    (median of connected pins, random perturbations, weighted centroid).
+    Uses cheap HPWL pre-filter to avoid expensive proxy cost evaluations
+    for moves that don't improve wirelength.
     """
     best = positions.clone().detach()
     num_hard = benchmark.num_hard_macros
@@ -184,6 +220,7 @@ def coordinate_descent_refine(
 
     start_time = time.time()
     total_improvements = 0
+    proxy_evals = 0
     no_improve_count = 0
 
     for sweep in range(num_sweeps):
@@ -242,16 +279,22 @@ def coordinate_descent_refine(
                 candidates.append((mean_x, mean_y))
 
                 # Interpolate between current and median
-                for alpha in [0.3, 0.5, 0.7]:
+                for alpha in [0.25, 0.5, 0.75]:
                     candidates.append((
                         cur_x + alpha * (med_x - cur_x),
                         cur_y + alpha * (med_y - cur_y),
                     ))
 
-            # Try each candidate
-            best_trial = None
-            best_trial_cost = best_cost
+            # Random perturbations (can improve density/congestion)
+            step = min(w, h) * 0.5
+            for _ in range(3):
+                candidates.append((
+                    cur_x + random.gauss(0, step),
+                    cur_y + random.gauss(0, step),
+                ))
 
+            # Collect valid candidates with HPWL pre-filter
+            valid_candidates = []
             for target_x, target_y in candidates:
                 target_x = max(w / 2, min(canvas_w - w / 2, target_x))
                 target_y = max(h / 2, min(canvas_h - h / 2, target_y))
@@ -268,11 +311,41 @@ def coordinate_descent_refine(
                 if abs(new_pos[0] - cur_x) < 0.1 and abs(new_pos[1] - cur_y) < 0.1:
                     continue
 
+                # Cheap HPWL delta check
+                hpwl_d = _hpwl_delta(
+                    idx, cur_x, cur_y, new_pos[0], new_pos[1],
+                    best, macro_nets, benchmark,
+                )
+                valid_candidates.append((new_pos, hpwl_d))
+
+            if not valid_candidates:
+                continue
+
+            # Sort by HPWL improvement, only evaluate the best ones with
+            # expensive proxy cost
+            valid_candidates.sort(key=lambda x: x[1])
+
+            # Evaluate top candidates (those that improve or barely hurt HPWL)
+            best_trial = None
+            best_trial_cost = best_cost
+            max_evals = 3  # Limit expensive evaluations per macro
+
+            evals_done = 0
+            for (new_pos, hpwl_d) in valid_candidates:
+                if evals_done >= max_evals:
+                    break
+                # Skip candidates that significantly worsen HPWL
+                # (allow small HPWL increase since density/congestion may improve)
+                if hpwl_d > 0 and evals_done > 0:
+                    break
+
                 trial = best.clone()
                 trial[idx, 0] = new_pos[0]
                 trial[idx, 1] = new_pos[1]
 
                 trial_cost = compute_cost_fn(trial, benchmark, plc)['proxy_cost']
+                proxy_evals += 1
+                evals_done += 1
                 if trial_cost < best_trial_cost:
                     best_trial_cost = trial_cost
                     best_trial = trial
@@ -285,7 +358,8 @@ def coordinate_descent_refine(
 
         elapsed = time.time() - start_time
         print(f"    CD sweep {sweep+1}: cost={best_cost:.4f} "
-              f"improvements={total_improvements} [{elapsed:.1f}s]", flush=True)
+              f"improvements={total_improvements} evals={proxy_evals} "
+              f"[{elapsed:.1f}s]", flush=True)
 
         if not improved:
             no_improve_count += 1

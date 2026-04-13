@@ -57,6 +57,7 @@ def density_loss(
 ) -> torch.Tensor:
     """
     Fully vectorized grid-based density loss (hard macros only).
+    Uses L2 excess density penalty.
     """
     device = positions.device
     num_hard = benchmark.num_hard_macros
@@ -91,6 +92,64 @@ def density_loss(
 
     excess = F.relu(density - target_density * 1.5)
     return (excess ** 2).sum()
+
+
+def density_loss_top_k(
+    positions: torch.Tensor,
+    benchmark,
+    grid_col: int = 0,
+    grid_row: int = 0,
+) -> torch.Tensor:
+    """
+    Density loss matching the evaluator: soft top-K average of grid cell
+    densities, including ALL macros (hard + soft) on the benchmark's grid.
+
+    The evaluator computes density_cost = 0.5 * avg(top_10%_cell_densities).
+    This function provides a differentiable approximation using softmax-weighted
+    average that focuses gradients on the highest-density cells.
+    """
+    device = positions.device
+    num_macros = benchmark.num_macros
+    canvas_w = benchmark.canvas_width
+    canvas_h = benchmark.canvas_height
+
+    # Use benchmark grid if not specified
+    if grid_col == 0:
+        grid_col = getattr(benchmark, 'grid_cols', 32)
+    if grid_row == 0:
+        grid_row = getattr(benchmark, 'grid_rows', 32)
+
+    all_pos = positions[:num_macros]
+    all_sizes = benchmark.macro_sizes[:num_macros].to(device)
+
+    cell_w = canvas_w / grid_col
+    cell_h = canvas_h / grid_row
+
+    bin_x_lo = torch.arange(grid_col, device=device).float() * cell_w
+    bin_x_hi = bin_x_lo + cell_w
+    bin_y_lo = torch.arange(grid_row, device=device).float() * cell_h
+    bin_y_hi = bin_y_lo + cell_h
+
+    macro_left = all_pos[:, 0] - all_sizes[:, 0] / 2
+    macro_right = all_pos[:, 0] + all_sizes[:, 0] / 2
+    macro_bot = all_pos[:, 1] - all_sizes[:, 1] / 2
+    macro_top = all_pos[:, 1] + all_sizes[:, 1] / 2
+
+    ov_x = F.relu(torch.min(macro_right.unsqueeze(1), bin_x_hi.unsqueeze(0))
+                  - torch.max(macro_left.unsqueeze(1), bin_x_lo.unsqueeze(0)))
+    ov_y = F.relu(torch.min(macro_top.unsqueeze(1), bin_y_hi.unsqueeze(0))
+                  - torch.max(macro_bot.unsqueeze(1), bin_y_lo.unsqueeze(0)))
+
+    # density: [grid_col, grid_row] -> flatten
+    density = torch.mm(ov_x.T, ov_y) / (cell_w * cell_h)
+    density_flat = density.reshape(-1)
+
+    # Soft top-k: temperature-scaled softmax weights high-density cells
+    temp = 10.0
+    weights = F.softmax(temp * density_flat, dim=0)
+    weighted_mean = (weights * density_flat).sum()
+
+    return weighted_mean
 
 
 def overlap_loss(
