@@ -2,19 +2,20 @@
 Legalization and post-legalization refinement for macro placement.
 
 Converts continuous GNN output into a valid placement with zero overlaps,
-then refines via coordinate descent and simulated annealing.
+then refines via coordinate descent, density equalization, and simulated annealing.
 """
 
 import torch
 import time
 import random
 import math
+import numpy as np
 
 
 def _overlaps_any(px, py, pw, ph, placed_pos, placed_sizes):
     """Check if macro at (px,py) with size (pw,ph) overlaps any placed macro.
     Uses a small positive gap to prevent float-precision false overlaps."""
-    GAP = 0.01  # Small gap to prevent touching-edge overlaps
+    GAP = 0.01
     for i in range(len(placed_pos)):
         qx, qy = placed_pos[i]
         qw, qh = placed_sizes[i]
@@ -27,65 +28,98 @@ def _overlaps_any(px, py, pw, ph, placed_pos, placed_sizes):
     return False
 
 
-def _find_nearest_valid(px, py, w, h, placed_pos, placed_sizes, canvas_w, canvas_h):
+def _overlaps_any_np(px, py, pw, ph, pp_np, ps_np):
+    """Vectorized overlap check using numpy arrays. ~50x faster than Python loop."""
+    if len(pp_np) == 0:
+        return False
+    dx = np.abs(px - pp_np[:, 0])
+    dy = np.abs(py - pp_np[:, 1])
+    min_sep_x = (pw + ps_np[:, 0]) / 2.0 + 0.01
+    min_sep_y = (ph + ps_np[:, 1]) / 2.0 + 0.01
+    return bool(np.any((dx < min_sep_x) & (dy < min_sep_y)))
+
+
+def _find_nearest_valid(px, py, w, h, placed_pos, placed_sizes, canvas_w, canvas_h,
+                        pp_np=None, ps_np=None):
     """
     Find the nearest non-overlapping, in-bounds position to (px, py).
+    Uses numpy-vectorized overlap checks for speed.
 
-    Uses a multi-strategy search: spiral, then cardinal pushes, then full grid.
+    If pp_np/ps_np are provided, uses them directly (avoids repeated conversion).
+    Otherwise converts placed_pos/placed_sizes to numpy.
     """
     hw, hh = w / 2, h / 2
 
-    # Clamp to canvas first
     px = max(hw, min(canvas_w - hw, px))
     py = max(hh, min(canvas_h - hh, py))
 
+    # Use pre-built numpy arrays if provided, otherwise convert
+    if pp_np is None:
+        if len(placed_pos) > 0:
+            pp_np = np.array(placed_pos)
+            ps_np = np.array(placed_sizes)
+        else:
+            return (px, py)
+    elif len(pp_np) == 0:
+        return (px, py)
+
     # Try original position
-    if not _overlaps_any(px, py, w, h, placed_pos, placed_sizes):
+    if not _overlaps_any_np(px, py, w, h, pp_np, ps_np):
         return (px, py)
 
     best_pos = None
     best_dist = float('inf')
 
-    # Strategy 1: Try shifting away from each overlapping macro
-    for i in range(len(placed_pos)):
-        qx, qy = placed_pos[i]
-        qw, qh = placed_sizes[i]
-        dx_val = abs(px - qx)
-        dy_val = abs(py - qy)
-        if dx_val < (w + qw) / 2.0 and dy_val < (h + qh) / 2.0:
-            # This macro overlaps; try pushing in each cardinal direction
-            gap = 0.02
-            shifts = [
-                (qx + (qw + w) / 2.0 + gap, py),   # push right
-                (qx - (qw + w) / 2.0 - gap, py),   # push left
-                (px, qy + (qh + h) / 2.0 + gap),   # push up
-                (px, qy - (qh + h) / 2.0 - gap),   # push down
-            ]
-            for nx, ny in shifts:
-                nx = max(hw, min(canvas_w - hw, nx))
-                ny = max(hh, min(canvas_h - hh, ny))
-                if not _overlaps_any(nx, ny, w, h, placed_pos, placed_sizes):
-                    dist = (nx - px) ** 2 + (ny - py) ** 2
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_pos = (nx, ny)
+    # Strategy 1: Push away from overlapping macros (vectorized detection)
+    dx_all = np.abs(px - pp_np[:, 0])
+    dy_all = np.abs(py - pp_np[:, 1])
+    sep_x = (w + ps_np[:, 0]) / 2.0
+    sep_y = (h + ps_np[:, 1]) / 2.0
+    overlap_mask = (dx_all < sep_x) & (dy_all < sep_y)
+
+    for i in np.where(overlap_mask)[0]:
+        qx, qy = pp_np[i]
+        qw, qh = ps_np[i]
+        gap = 0.02
+        shifts = [
+            (qx + (qw + w) / 2.0 + gap, py),
+            (qx - (qw + w) / 2.0 - gap, py),
+            (px, qy + (qh + h) / 2.0 + gap),
+            (px, qy - (qh + h) / 2.0 - gap),
+        ]
+        for nx, ny in shifts:
+            nx = max(hw, min(canvas_w - hw, nx))
+            ny = max(hh, min(canvas_h - hh, ny))
+            if not _overlaps_any_np(nx, ny, w, h, pp_np, ps_np):
+                dist = (nx - px) ** 2 + (ny - py) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pos = (nx, ny)
 
     if best_pos is not None:
         return best_pos
 
-    # Strategy 2: Spiral search with finer resolution
+    # Strategy 2: Vectorized spiral search — check entire ring at once
     step = min(w, h) * 0.3
     for ring in range(1, 200):
         radius = ring * step
         num_points = max(8, int(2 * math.pi * radius / step))
-        for k in range(num_points):
-            angle = 2 * math.pi * k / num_points + ring * 0.1
-            nx = px + radius * math.cos(angle)
-            ny = py + radius * math.sin(angle)
-            nx = max(hw, min(canvas_w - hw, nx))
-            ny = max(hh, min(canvas_h - hh, ny))
-            if not _overlaps_any(nx, ny, w, h, placed_pos, placed_sizes):
-                return (nx, ny)
+        angles = np.arange(num_points) * (2 * math.pi / num_points) + ring * 0.1
+        xs = np.clip(px + radius * np.cos(angles), hw, canvas_w - hw)
+        ys = np.clip(py + radius * np.sin(angles), hh, canvas_h - hh)
+
+        # Batch overlap check: [num_points, num_placed]
+        dxs = np.abs(xs[:, np.newaxis] - pp_np[:, 0])
+        dys = np.abs(ys[:, np.newaxis] - pp_np[:, 1])
+        min_sep_x = (w + ps_np[:, 0]) / 2.0 + 0.01
+        min_sep_y = (h + ps_np[:, 1]) / 2.0 + 0.01
+        has_overlap = np.any((dxs < min_sep_x) & (dys < min_sep_y), axis=1)
+        valid = ~has_overlap
+
+        if np.any(valid):
+            # Pick the first valid point (closest along spiral)
+            idx = np.argmax(valid)
+            return (float(xs[idx]), float(ys[idx]))
 
     # Strategy 3: Exhaustive grid search as final fallback
     step_x = w * 1.01
@@ -95,10 +129,9 @@ def _find_nearest_valid(px, py, w, h, placed_pos, placed_sizes, canvas_w, canvas
             nx = gx_i * step_x + hw
             ny = gy_i * step_y + hh
             if nx + hw <= canvas_w + 0.01 and ny + hh <= canvas_h + 0.01:
-                if not _overlaps_any(nx, ny, w, h, placed_pos, placed_sizes):
+                if not _overlaps_any_np(nx, ny, w, h, pp_np, ps_np):
                     return (nx, ny)
 
-    # Absolute last resort
     return (max(hw, min(canvas_w - hw, px)),
             max(hh, min(canvas_h - hh, py)))
 
@@ -153,6 +186,166 @@ def legalize(
     return legal
 
 
+def density_equalize(
+    positions: torch.Tensor,
+    benchmark,
+    compute_cost_fn,
+    plc,
+    time_limit: float = 300.0,
+) -> torch.Tensor:
+    """
+    Density equalization: move macros from high-density regions to low-density ones.
+
+    Computes grid cell density, identifies macros in the densest cells,
+    and tries relocating them to less-dense cells. Each move is validated
+    with the full proxy cost to ensure improvement.
+    """
+    best = positions.clone().detach()
+    num_hard = benchmark.num_hard_macros
+    canvas_w = float(benchmark.canvas_width)
+    canvas_h = float(benchmark.canvas_height)
+    sizes = benchmark.macro_sizes.cpu()
+    fixed = benchmark.macro_fixed.cpu()
+    grid_col = benchmark.grid_cols
+    grid_row = benchmark.grid_rows
+
+    # Use fast eval (skip congestion) for DenEq — focuses on density improvement
+    best_cost = compute_cost_fn(best, benchmark, plc, skip_congestion=True)['proxy_cost']
+    start_time = time.time()
+    improvements = 0
+    evals = 0
+
+    cell_w = canvas_w / grid_col
+    cell_h = canvas_h / grid_row
+
+    for round_i in range(5):
+        if time.time() - start_time > time_limit:
+            break
+
+        # Compute density grid (hard macros only for targeting)
+        pos_np = best[:num_hard].numpy()
+        sizes_np = sizes[:num_hard].numpy()
+        density = np.zeros((grid_row, grid_col))
+
+        for i in range(num_hard):
+            x, y = pos_np[i]
+            w, h = sizes_np[i]
+            x0 = max(0, int((x - w / 2) / cell_w))
+            x1 = min(grid_col - 1, int((x + w / 2) / cell_w))
+            y0 = max(0, int((y - h / 2) / cell_h))
+            y1 = min(grid_row - 1, int((y + h / 2) / cell_h))
+            for r in range(y0, y1 + 1):
+                for c in range(x0, x1 + 1):
+                    # Overlap area between macro and cell
+                    ox = max(0, min(x + w / 2, (c + 1) * cell_w) - max(x - w / 2, c * cell_w))
+                    oy = max(0, min(y + h / 2, (r + 1) * cell_h) - max(y - h / 2, r * cell_h))
+                    density[r, c] += ox * oy / (cell_w * cell_h)
+
+        # Find top 10% densest cells
+        flat_den = density.flatten()
+        k = max(1, len(flat_den) // 10)
+        top_indices = np.argsort(flat_den)[-k:]
+        avg_density = flat_den.mean()
+
+        # Find macros in the densest cells
+        dense_macros = set()
+        for flat_idx in top_indices:
+            r, c = divmod(flat_idx, grid_col)
+            cx = (c + 0.5) * cell_w
+            cy = (r + 0.5) * cell_h
+            for i in range(num_hard):
+                if fixed[i]:
+                    continue
+                x, y = pos_np[i]
+                w_i, h_i = sizes_np[i]
+                if abs(x - cx) < (w_i / 2 + cell_w) and abs(y - cy) < (h_i / 2 + cell_h):
+                    dense_macros.add(i)
+
+        # Find low-density target regions (below average)
+        low_cells = [(r, c) for r in range(grid_row) for c in range(grid_col)
+                     if density[r, c] < avg_density * 0.5]
+        if not low_cells:
+            low_cells = [(r, c) for r in range(grid_row) for c in range(grid_col)
+                         if density[r, c] < avg_density]
+
+        # Try moving each dense macro toward a low-density cell
+        dense_list = list(dense_macros)
+        random.shuffle(dense_list)
+
+        placed_pos = []
+        placed_sizes = []
+        for j in range(num_hard):
+            placed_pos.append((best[j, 0].item(), best[j, 1].item()))
+            placed_sizes.append((sizes[j, 0].item(), sizes[j, 1].item()))
+
+        for idx in dense_list:
+            if time.time() - start_time > time_limit:
+                break
+
+            w = sizes[idx, 0].item()
+            h = sizes[idx, 1].item()
+            cur_x = best[idx, 0].item()
+            cur_y = best[idx, 1].item()
+
+            # Build placed list excluding this macro (as numpy arrays)
+            placed_ex = [(placed_pos[j], placed_sizes[j]) for j in range(num_hard) if j != idx]
+            pp = [p[0] for p in placed_ex]
+            ps = [p[1] for p in placed_ex]
+            pp_np_de = np.array(pp) if pp else np.empty((0, 2))
+            ps_np_de = np.array(ps) if ps else np.empty((0, 2))
+
+            # Sort low-density cells: prefer cells near current position
+            # (less displacement = less wirelength impact)
+            scored_cells = [(r, c, abs((c+0.5)*cell_w - cur_x) + abs((r+0.5)*cell_h - cur_y))
+                           for r, c in low_cells]
+            scored_cells.sort(key=lambda x: x[2])
+            targets = [(r, c) for r, c, _ in scored_cells[:12]]
+
+            best_trial = None
+            best_trial_cost = best_cost
+
+            for (tr, tc) in targets:
+                if time.time() - start_time > time_limit:
+                    break
+                target_x = (tc + 0.5) * cell_w
+                target_y = (tr + 0.5) * cell_h
+                target_x = max(w / 2, min(canvas_w - w / 2, target_x))
+                target_y = max(h / 2, min(canvas_h - h / 2, target_y))
+
+                new_pos = _find_nearest_valid(
+                    target_x, target_y, w, h, pp, ps, canvas_w, canvas_h,
+                    pp_np=pp_np_de, ps_np=ps_np_de,
+                )
+                if _overlaps_any_np(new_pos[0], new_pos[1], w, h, pp_np_de, ps_np_de):
+                    continue
+                if abs(new_pos[0] - cur_x) < 0.1 and abs(new_pos[1] - cur_y) < 0.1:
+                    continue
+
+                trial = best.clone()
+                trial[idx, 0] = new_pos[0]
+                trial[idx, 1] = new_pos[1]
+                trial_cost = compute_cost_fn(trial, benchmark, plc, skip_congestion=True)['proxy_cost']
+                evals += 1
+
+                if trial_cost < best_trial_cost:
+                    best_trial_cost = trial_cost
+                    best_trial = trial
+                    break  # Accept first improvement
+
+            if best_trial is not None:
+                best = best_trial
+                best_cost = best_trial_cost
+                improvements += 1
+                # Update placed_pos
+                placed_pos[idx] = (best[idx, 0].item(), best[idx, 1].item())
+
+        elapsed = time.time() - start_time
+        print(f"    DenEq round {round_i+1}: cost={best_cost:.4f} "
+              f"improvements={improvements} evals={evals} [{elapsed:.1f}s]", flush=True)
+
+    return best
+
+
 def _hpwl_delta(idx, old_x, old_y, new_x, new_y, positions, macro_nets, benchmark):
     """
     Compute change in HPWL if macro idx moves from (old_x,old_y) to (new_x,new_y).
@@ -195,12 +388,13 @@ def coordinate_descent_refine(
     plc,
     num_sweeps: int = 20,
     time_limit: float = 2700.0,
+    skip_congestion: bool = True,
 ) -> torch.Tensor:
     """
     Coordinate descent: for each macro, try multiple candidate positions
     (median of connected pins, random perturbations, weighted centroid).
-    Uses cheap HPWL pre-filter to avoid expensive proxy cost evaluations
-    for moves that don't improve wirelength.
+    Uses cheap HPWL pre-filter + configurable congestion skipping for
+    fast proxy cost evaluations.
     """
     best = positions.clone().detach()
     num_hard = benchmark.num_hard_macros
@@ -209,7 +403,7 @@ def coordinate_descent_refine(
     sizes = benchmark.macro_sizes.cpu()
     fixed = benchmark.macro_fixed.cpu()
 
-    best_cost = compute_cost_fn(best, benchmark, plc)['proxy_cost']
+    best_cost = compute_cost_fn(best, benchmark, plc, skip_congestion=skip_congestion)['proxy_cost']
 
     # Build net-to-macro adjacency
     macro_nets = [[] for _ in range(benchmark.num_macros)]
@@ -223,9 +417,32 @@ def coordinate_descent_refine(
     proxy_evals = 0
     no_improve_count = 0
 
+    grid_col = getattr(benchmark, 'grid_cols', 32)
+    grid_row = getattr(benchmark, 'grid_rows', 32)
+    cell_w_cd = canvas_w / grid_col
+    cell_h_cd = canvas_h / grid_row
+
     for sweep in range(num_sweeps):
         if time.time() - start_time > time_limit:
             break
+
+        # Compute density grid for density-aware candidates
+        pos_np_cd = best[:num_hard].detach().numpy()
+        sizes_np_cd = sizes[:num_hard].numpy()
+        den_grid = np.zeros((grid_row, grid_col))
+        for mi in range(num_hard):
+            mx, my = pos_np_cd[mi]
+            mw, mh = sizes_np_cd[mi]
+            c0 = max(0, int((mx - mw/2) / cell_w_cd))
+            c1 = min(grid_col-1, int((mx + mw/2) / cell_w_cd))
+            r0 = max(0, int((my - mh/2) / cell_h_cd))
+            r1 = min(grid_row-1, int((my + mh/2) / cell_h_cd))
+            for rr in range(r0, r1+1):
+                for cc in range(c0, c1+1):
+                    ox = max(0, min(mx+mw/2, (cc+1)*cell_w_cd) - max(mx-mw/2, cc*cell_w_cd))
+                    oy = max(0, min(my+mh/2, (rr+1)*cell_h_cd) - max(my-mh/2, rr*cell_h_cd))
+                    den_grid[rr, cc] += ox * oy / (cell_w_cd * cell_h_cd)
+        den_avg = den_grid.mean()
 
         improved = False
         movable_indices = [i for i in range(num_hard) if not fixed[i]]
@@ -255,13 +472,15 @@ def coordinate_descent_refine(
                         connected_x.append(benchmark.port_positions[port_idx, 0].item())
                         connected_y.append(benchmark.port_positions[port_idx, 1].item())
 
-            # Build placed list excluding current macro
+            # Build placed list excluding current macro (as numpy arrays)
             placed_pos = []
             placed_sizes = []
             for j in range(num_hard):
                 if j != idx:
                     placed_pos.append((best[j, 0].item(), best[j, 1].item()))
                     placed_sizes.append((sizes[j, 0].item(), sizes[j, 1].item()))
+            pp_np_cd = np.array(placed_pos) if placed_pos else np.empty((0, 2))
+            ps_np_cd = np.array(placed_sizes) if placed_sizes else np.empty((0, 2))
 
             # Generate candidate target positions
             candidates = []
@@ -285,6 +504,27 @@ def coordinate_descent_refine(
                         cur_y + alpha * (med_y - cur_y),
                     ))
 
+            # Density-aware: move toward low-density region nearby
+            cur_r = min(grid_row-1, max(0, int(cur_y / cell_h_cd)))
+            cur_c = min(grid_col-1, max(0, int(cur_x / cell_w_cd)))
+            if den_grid[cur_r, cur_c] > den_avg:
+                # Find nearest low-density cell
+                low_r, low_c = cur_r, cur_c
+                best_score_den = float('inf')
+                search_r = max(3, int(h / cell_h_cd) + 2)
+                search_c = max(3, int(w / cell_w_cd) + 2)
+                for dr in range(-search_r, search_r+1):
+                    for dc in range(-search_c, search_c+1):
+                        nr, nc = cur_r+dr, cur_c+dc
+                        if 0 <= nr < grid_row and 0 <= nc < grid_col:
+                            # Score: density + distance penalty
+                            dist = (abs(dr) + abs(dc)) * 0.1
+                            score_den = den_grid[nr, nc] + dist
+                            if score_den < best_score_den:
+                                best_score_den = score_den
+                                low_r, low_c = nr, nc
+                candidates.append(((low_c+0.5)*cell_w_cd, (low_r+0.5)*cell_h_cd))
+
             # Random perturbations (can improve density/congestion)
             step = min(w, h) * 0.5
             for _ in range(3):
@@ -294,18 +534,24 @@ def coordinate_descent_refine(
                 ))
 
             # Collect valid candidates with HPWL pre-filter
+            # Fast path: check candidate directly, skip expensive spiral search
             valid_candidates = []
             for target_x, target_y in candidates:
                 target_x = max(w / 2, min(canvas_w - w / 2, target_x))
                 target_y = max(h / 2, min(canvas_h - h / 2, target_y))
 
-                new_pos = _find_nearest_valid(
-                    target_x, target_y, w, h,
-                    placed_pos, placed_sizes, canvas_w, canvas_h,
-                )
-
-                if _overlaps_any(new_pos[0], new_pos[1], w, h, placed_pos, placed_sizes):
-                    continue
+                # Check if candidate position is directly valid (no overlap)
+                if not _overlaps_any_np(target_x, target_y, w, h, pp_np_cd, ps_np_cd):
+                    new_pos = (target_x, target_y)
+                else:
+                    # Try push-away from nearest overlapping macro (cheap)
+                    new_pos = _find_nearest_valid(
+                        target_x, target_y, w, h,
+                        placed_pos, placed_sizes, canvas_w, canvas_h,
+                        pp_np=pp_np_cd, ps_np=ps_np_cd,
+                    )
+                    if _overlaps_any_np(new_pos[0], new_pos[1], w, h, pp_np_cd, ps_np_cd):
+                        continue
 
                 # Skip if barely moved
                 if abs(new_pos[0] - cur_x) < 0.1 and abs(new_pos[1] - cur_y) < 0.1:
@@ -343,7 +589,7 @@ def coordinate_descent_refine(
                 trial[idx, 0] = new_pos[0]
                 trial[idx, 1] = new_pos[1]
 
-                trial_cost = compute_cost_fn(trial, benchmark, plc)['proxy_cost']
+                trial_cost = compute_cost_fn(trial, benchmark, plc, skip_congestion=skip_congestion)['proxy_cost']
                 proxy_evals += 1
                 evals_done += 1
                 if trial_cost < best_trial_cost:
@@ -357,7 +603,8 @@ def coordinate_descent_refine(
                 total_improvements += 1
 
         elapsed = time.time() - start_time
-        print(f"    CD sweep {sweep+1}: cost={best_cost:.4f} "
+        label = "CD" if skip_congestion else "CD-full"
+        print(f"    {label} sweep {sweep+1}: cost={best_cost:.4f} "
               f"improvements={total_improvements} evals={proxy_evals} "
               f"[{elapsed:.1f}s]", flush=True)
 

@@ -64,15 +64,18 @@ def density_loss(
     canvas_w = benchmark.canvas_width
     canvas_h = benchmark.canvas_height
 
+    grid_col = grid_size
+    grid_row = grid_size
+
     hard_pos = positions[:num_hard]
     hard_sizes = benchmark.macro_sizes[:num_hard].to(device)
 
-    cell_w = canvas_w / grid_size
-    cell_h = canvas_h / grid_size
+    cell_w = canvas_w / grid_col
+    cell_h = canvas_h / grid_row
 
-    bin_x_lo = torch.arange(grid_size, device=device).float() * cell_w
+    bin_x_lo = torch.arange(grid_col, device=device).float() * cell_w
     bin_x_hi = bin_x_lo + cell_w
-    bin_y_lo = torch.arange(grid_size, device=device).float() * cell_h
+    bin_y_lo = torch.arange(grid_row, device=device).float() * cell_h
     bin_y_hi = bin_y_lo + cell_h
 
     macro_left = hard_pos[:, 0] - hard_sizes[:, 0] / 2
@@ -187,6 +190,90 @@ def overlap_loss(
     return ov_area.sum() / 2
 
 
+def congestion_loss(
+    positions: torch.Tensor,
+    graph,
+    benchmark,
+    gamma: float = 10.0,
+) -> torch.Tensor:
+    """
+    Differentiable RUDY congestion approximation.
+
+    Distributes routing demand uniformly within each net's smooth bounding box.
+    Penalizes grid cells with high accumulated demand using soft top-k.
+    This targets the evaluator's congestion metric directly.
+    """
+    device = positions.device
+    num_ports = benchmark.port_positions.size(0)
+
+    grid_col = benchmark.grid_cols
+    grid_row = benchmark.grid_rows
+    canvas_w = benchmark.canvas_width
+    canvas_h = benchmark.canvas_height
+
+    # All node positions (macros + ports)
+    if num_ports > 0:
+        port_pos = benchmark.port_positions.to(device)
+        all_positions = torch.cat([positions, port_pos], dim=0)
+    else:
+        all_positions = positions
+
+    indices = graph.pin_node_indices.clamp(0, all_positions.size(0) - 1)
+    pin_positions = all_positions[indices]  # [num_nets, max_degree, 2]
+    mask = graph.net_mask  # [num_nets, max_degree]
+
+    large_val = 1e6
+    coords = pin_positions
+    mask_2d = mask.unsqueeze(-1).expand_as(coords)
+
+    coords_for_max = coords.masked_fill(~mask_2d, -large_val)
+    coords_for_min = coords.masked_fill(~mask_2d, large_val)
+
+    # Smooth bounding boxes per net [num_nets, 2]
+    bbox_max = torch.logsumexp(gamma * coords_for_max, dim=1) / gamma
+    bbox_min = -torch.logsumexp(-gamma * coords_for_min, dim=1) / gamma
+
+    bbox_w = (bbox_max[:, 0] - bbox_min[:, 0]).clamp(min=1e-3)
+    bbox_h = (bbox_max[:, 1] - bbox_min[:, 1]).clamp(min=1e-3)
+
+    # Grid cell boundaries
+    cell_w = canvas_w / grid_col
+    cell_h = canvas_h / grid_row
+
+    bin_x_lo = torch.arange(grid_col, device=device).float() * cell_w
+    bin_x_hi = bin_x_lo + cell_w
+    bin_y_lo = torch.arange(grid_row, device=device).float() * cell_h
+    bin_y_hi = bin_y_lo + cell_h
+
+    # Overlap between net bboxes and grid cells
+    ov_x = F.relu(torch.min(bbox_max[:, 0:1], bin_x_hi.unsqueeze(0))
+                  - torch.max(bbox_min[:, 0:1], bin_x_lo.unsqueeze(0)))  # [N, grid_col]
+    ov_y = F.relu(torch.min(bbox_max[:, 1:2], bin_y_hi.unsqueeze(0))
+                  - torch.max(bbox_min[:, 1:2], bin_y_lo.unsqueeze(0)))  # [N, grid_row]
+
+    # RUDY demand: weight * overlap_area / bbox_area per cell
+    bbox_area = (bbox_w * bbox_h).clamp(min=cell_w * cell_h * 0.01)
+    net_weights = graph.net_weights
+    demand_weight = net_weights / bbox_area  # [N]
+
+    weighted_ov_x = ov_x * demand_weight.unsqueeze(1)  # [N, grid_col]
+    demand = torch.mm(weighted_ov_x.T, ov_y)  # [grid_col, grid_row]
+
+    # Normalize by routing capacity
+    h_cap = cell_h * benchmark.hroutes_per_micron
+    v_cap = cell_w * benchmark.vroutes_per_micron
+    avg_cap = (h_cap + v_cap) / 2
+    demand_norm = demand / max(avg_cap, 1e-6)
+
+    # Soft top-5% (evaluator uses abu with 5% for congestion)
+    demand_flat = demand_norm.reshape(-1)
+    temp = 10.0
+    weights = F.softmax(temp * demand_flat, dim=0)
+    congestion = (weights * demand_flat).sum()
+
+    return congestion
+
+
 def spreading_loss(
     positions: torch.Tensor,
     benchmark,
@@ -195,7 +282,6 @@ def spreading_loss(
     Lightweight spreading force to encourage macros to use the canvas area.
 
     Penalizes the variance of macro positions being too low (all clustered together).
-    This is a fast alternative to full congestion estimation.
     """
     device = positions.device
     num_hard = benchmark.num_hard_macros
@@ -211,15 +297,10 @@ def spreading_loss(
     norm_x = movable_pos[:, 0] / benchmark.canvas_width
     norm_y = movable_pos[:, 1] / benchmark.canvas_height
 
-    # We want positions to be spread out - penalize low variance
-    # Use negative variance as loss (minimizing this maximizes spread)
-    var_x = norm_x.var()
-    var_y = norm_y.var()
-
     # Target variance for uniform distribution on [0,1] is 1/12 ~ 0.083
     target_var = 0.06
-    loss_x = F.relu(target_var - var_x)
-    loss_y = F.relu(target_var - var_y)
+    loss_x = F.relu(target_var - norm_x.var())
+    loss_y = F.relu(target_var - norm_y.var())
 
     return loss_x + loss_y
 
@@ -235,6 +316,11 @@ def total_loss(
 ) -> tuple:
     """
     Compute total weighted loss with annealing schedule.
+
+    Three phases:
+      1. Early (t<0.2): Spreading + basic density + light overlap
+      2. Mid (0.2<t<0.6): Ramp up overlap + density_topk + congestion
+      3. Late (t>0.6): Strong overlap + density_topk + congestion targeting evaluator
     """
     device = positions.device
     t = epoch / max(max_epochs - 1, 1)
@@ -257,23 +343,44 @@ def total_loss(
         w_ov = 10.0 + (t - 0.6) / 0.4 * 90.0
         w_spread = 0.1
 
+    # density_topk and congestion losses disabled:
+    # - density_topk adds 30-40s per GNN restart for 1140-macro benchmarks
+    #   without clear benefit (evaluator density better optimized via DenEq)
+    # - RUDY congestion doesn't match evaluator's routing-based metric
+    w_den_topk = 0.0
+    w_cong = 0.0
+
     # Compute losses
     l_wl = wirelength_loss(positions, graph, benchmark, gamma=gamma)
     l_ov = overlap_loss(positions, benchmark)
     l_den = density_loss(positions, benchmark)
     l_spread = spreading_loss(positions, benchmark)
 
+    # Compute evaluator-aligned losses only when their weights are active
+    if w_den_topk > 0:
+        l_den_topk = density_loss_top_k(positions, benchmark)
+    else:
+        l_den_topk = torch.tensor(0.0, device=device)
+
+    if w_cong > 0:
+        l_cong = congestion_loss(positions, graph, benchmark, gamma=gamma)
+    else:
+        l_cong = torch.tensor(0.0, device=device)
+
     # Normalize
     canvas_area = benchmark.canvas_width * benchmark.canvas_height
     l_wl_norm = l_wl / (canvas_area + 1e-6)
     l_ov_norm = l_ov / (canvas_area + 1e-6)
 
-    total = w_wl * l_wl_norm + w_den * l_den + w_ov * l_ov_norm + w_spread * l_spread
+    total = (w_wl * l_wl_norm + w_den * l_den + w_ov * l_ov_norm +
+             w_spread * l_spread + w_den_topk * l_den_topk + w_cong * l_cong)
 
     loss_dict = {
         'total': total.item(),
         'wirelength': l_wl_norm.item(),
         'density': l_den.item(),
+        'density_topk': l_den_topk.item(),
+        'congestion': l_cong.item(),
         'overlap': l_ov_norm.item(),
         'spread': l_spread.item(),
         'gamma': gamma,

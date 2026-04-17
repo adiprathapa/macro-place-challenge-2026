@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from graph import build_graph
 from model import PlacementGNN
 from losses import total_loss
-from legalize import legalize, coordinate_descent_refine, sa_refine
+from legalize import legalize, coordinate_descent_refine, sa_refine, density_equalize
 from eplace import ElectrostaticOptimizer
 
 from macro_place.benchmark import Benchmark
@@ -35,15 +35,15 @@ from macro_place.loader import load_benchmark_from_dir, load_benchmark
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
-NUM_RESTARTS = 8           # GNN initialization restarts (more = better init)
+NUM_RESTARTS = 5           # GNN initialization restarts
 GNN_EPOCHS = 150           # Gradient steps per GNN restart
 GNN_HIDDEN_DIM = 48        # GNN hidden dimension
 GNN_LAYERS = 4             # Number of GNN message-passing layers
 GNN_LR = 5e-3              # Initial learning rate
-EPLACE_ITERS = 800         # Electrostatic force-directed iterations
-EPLACE_GRID = 64           # Density grid resolution for Poisson solver
-CD_SWEEPS = 20             # Coordinate descent sweeps (more sweeps = better refinement)
-SA_TIME_LIMIT = 30.0       # Time limit for SA refinement (seconds) — fast numpy SA
+EPLACE_ITERS = 5000        # ePlace iterations (more = better density/congestion optimization)
+EPLACE_GRID = 64           # Density grid resolution
+CD_SWEEPS = 20             # Coordinate descent sweeps
+SA_TIME_LIMIT = 30.0       # Time limit for SA refinement (seconds)
 TOTAL_TIME_LIMIT = 3300.0  # Total time budget per benchmark (55 min, 5 min buffer)
 
 # Known benchmark directories
@@ -114,7 +114,7 @@ class GNNPlacer:
         best_gnn_positions = None
         best_gnn_cost = float('inf')
 
-        time_for_gnn = min(TOTAL_TIME_LIMIT * 0.12, 400)  # 12% or ~7 min max
+        time_for_gnn = min(TOTAL_TIME_LIMIT * 0.08, 280)  # 8% or ~5 min max
 
         for restart in range(NUM_RESTARTS):
             if time.time() - start_time > time_for_gnn:
@@ -162,7 +162,7 @@ class GNNPlacer:
 
         # ── Step 3: Electrostatic force-directed optimization ──────────
         remaining = TOTAL_TIME_LIMIT - (time.time() - start_time)
-        eplace_time = min(remaining * 0.05, 120)  # ePlace is fast, ~30s
+        eplace_time = min(remaining * 0.35, 900)  # ePlace is the most effective stage
 
         if eplace_time > 10:
             t0 = time.time()
@@ -203,8 +203,8 @@ class GNNPlacer:
 
         # ── Step 5: Fast SA refinement (HPWL-based, numpy) ────────────
         remaining_time = TOTAL_TIME_LIMIT - (time.time() - start_time)
-        if remaining_time > 60 and plc is not None and ov['overlap_count'] == 0:
-            sa_time = min(SA_TIME_LIMIT, remaining_time * 0.05)  # More SA time
+        if remaining_time > 120 and plc is not None and ov['overlap_count'] == 0:
+            sa_time = min(SA_TIME_LIMIT, remaining_time * 0.02)
             t0 = time.time()
             legal_positions = sa_refine(
                 legal_positions, benchmark, compute_proxy_cost,
@@ -212,18 +212,46 @@ class GNNPlacer:
             )
             print(f"    SA refinement done [{time.time()-t0:.1f}s]")
 
-        # ── Step 6: Coordinate descent refinement ──────────────────────
+        # ── Step 6: Density equalization ──────────────────────────────
         remaining_time = TOTAL_TIME_LIMIT - (time.time() - start_time)
-        if remaining_time > 60 and plc is not None:
+        if remaining_time > 300 and plc is not None and ov['overlap_count'] == 0:
+            # Reserve 40% of remaining time for CD + congestion-aware pass
+            den_time = min(600, remaining_time * 0.30)
+            t0 = time.time()
+            legal_positions = density_equalize(
+                legal_positions, benchmark, compute_proxy_cost,
+                plc, time_limit=den_time,
+            )
+            print(f"    Density equalization done [{time.time()-t0:.1f}s]")
+
+        # ── Step 7: Coordinate descent refinement (skip congestion) ───
+        remaining_time = TOTAL_TIME_LIMIT - (time.time() - start_time)
+        if remaining_time > 300 and plc is not None:
             ov2 = compute_overlap_metrics(legal_positions, benchmark)
             if ov2['overlap_count'] == 0:
-                cd_time = remaining_time * 0.95
+                # Reserve 60% of remaining time for congestion-aware pass
+                cd_time = remaining_time * 0.30
                 t0 = time.time()
                 legal_positions = coordinate_descent_refine(
                     legal_positions, benchmark, compute_proxy_cost,
                     plc, num_sweeps=CD_SWEEPS, time_limit=cd_time,
                 )
                 print(f"    Coordinate descent done [{time.time()-t0:.1f}s]")
+
+        # ── Step 8: Congestion-aware CD (full cost) ───────────────────
+        # Most important: optimizes the full proxy cost including congestion
+        remaining_time = TOTAL_TIME_LIMIT - (time.time() - start_time)
+        if remaining_time > 120 and plc is not None:
+            ov3 = compute_overlap_metrics(legal_positions, benchmark)
+            if ov3['overlap_count'] == 0:
+                cong_time = remaining_time - 60  # Keep 60s buffer
+                t0 = time.time()
+                legal_positions = coordinate_descent_refine(
+                    legal_positions, benchmark, compute_proxy_cost,
+                    plc, num_sweeps=CD_SWEEPS, time_limit=cong_time,
+                    skip_congestion=False,
+                )
+                print(f"    Congestion-aware CD done [{time.time()-t0:.1f}s]")
 
         total_time = time.time() - start_time
         if plc is not None:
@@ -284,3 +312,4 @@ class GNNPlacer:
                 best_positions = positions.detach().clone()
 
         return best_positions
+

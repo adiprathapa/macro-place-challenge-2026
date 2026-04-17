@@ -117,6 +117,7 @@ def compute_proxy_cost(
     benchmark: Benchmark,
     plc: PlacementCost,
     weights: Optional[Dict[str, float]] = None,
+    skip_congestion: bool = False,
 ) -> Dict[str, float]:
     """
     Compute proxy cost using PlacementCost's ground truth evaluator.
@@ -130,6 +131,9 @@ def compute_proxy_cost(
             'density': 0.5,
             'congestion': 0.5
         }
+        skip_congestion: If True, skip expensive congestion computation (~3x faster).
+            Use for intermediate CD/DenEq evaluations where speed matters more
+            than exact cost.
 
     Returns:
         {
@@ -138,10 +142,7 @@ def compute_proxy_cost(
             'density_cost': float,
             'congestion_cost': float,
             'overlap_count': int,
-            'total_overlap_area': float,
-            'max_overlap_area': float,
-            'num_macros_with_overlaps': int,
-            'overlap_ratio': float,
+            ...
         }
     """
     if weights is None:
@@ -153,7 +154,10 @@ def compute_proxy_cost(
     # Compute costs using PlacementCost methods
     wirelength_cost = plc.get_cost()
     density_cost = plc.get_density_cost()
-    congestion_cost = plc.get_congestion_cost()  # Fixed with monkey-patch above
+    if skip_congestion:
+        congestion_cost = 0.0
+    else:
+        congestion_cost = plc.get_congestion_cost()
 
     # Weighted sum (matching ISPD 2023 paper convention)
     proxy = (
@@ -170,7 +174,7 @@ def compute_proxy_cost(
         "wirelength_cost": wirelength_cost,
         "density_cost": density_cost,
         "congestion_cost": congestion_cost,
-        **overlap_metrics,  # Add all overlap metrics
+        **overlap_metrics,
     }
 
 

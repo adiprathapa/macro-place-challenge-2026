@@ -118,22 +118,27 @@ class ElectrostaticOptimizer:
             with torch.no_grad():
                 self._clamp(positions, fixed_pos)
 
-            # Track best positions
+            # Track best positions — use wirelength+density+overlap scoring
+            # (validated to correlate with evaluator's proxy cost)
             with torch.no_grad():
                 ov_val = ld.get('overlap', 0.0)
                 wl_val = ld.get('wirelength', 0.0)
                 den_val = ld.get('density', 0.0)
+                den_topk = ld.get('density_topk', 0.0)
+                cong_val = ld.get('congestion', 0.0)
                 score = wl_val + 3.0 * den_val + 10.0 * ov_val
                 if score < best_score:
                     best_score = score
                     best_positions = positions.detach().clone()
 
             # Logging
-            if it == 0 or (it + 1) % 100 == 0 or it == num_iters - 1:
+            if it == 0 or (it + 1) % 500 == 0 or it == num_iters - 1:
                 elapsed = time.time() - start
                 print(f"      ePlace iter {it+1}/{num_iters}: "
                       f"wl={wl_val:.6f} "
                       f"den={den_val:.4f} "
+                      f"dtk={den_topk:.4f} "
+                      f"cng={cong_val:.4f} "
                       f"ov={ov_val:.6f} "
                       f"[{elapsed:.1f}s]", flush=True)
 
