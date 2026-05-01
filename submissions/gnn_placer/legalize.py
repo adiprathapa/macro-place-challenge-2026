@@ -12,6 +12,69 @@ import math
 import numpy as np
 
 
+def _set_placement_on_plc(plc, placement, benchmark):
+    """Update macro/pin positions in PlacementCost and mark cost flags dirty.
+
+    Self-contained so the submission doesn't depend on any private helper in
+    macro_place.objective — we drive the public PlacementCost API directly.
+    """
+    placement_np = placement.cpu().numpy()
+
+    if not hasattr(plc, '_macro_pin_map'):
+        pin_map = {}
+        for idx, mod in enumerate(plc.modules_w_pins):
+            if mod.get_type() == 'MACRO_PIN' and hasattr(mod, 'get_macro_name'):
+                name = mod.get_macro_name()
+                pin_map.setdefault(name, []).append(idx)
+        plc._macro_pin_map = pin_map
+
+    for i, macro_idx in enumerate(benchmark.hard_macro_indices):
+        x, y = placement_np[i]
+        node = plc.modules_w_pins[macro_idx]
+        node.set_pos(x, y)
+        for pin_idx in plc._macro_pin_map.get(node.get_name(), []):
+            pin = plc.modules_w_pins[pin_idx]
+            pin.set_pos(x + pin.x_offset, y + pin.y_offset)
+
+    num_hard = benchmark.num_hard_macros
+    for i, macro_idx in enumerate(benchmark.soft_macro_indices):
+        x, y = placement_np[num_hard + i]
+        node = plc.modules_w_pins[macro_idx]
+        node.set_pos(x, y)
+        for pin_idx in plc._macro_pin_map.get(node.get_name(), []):
+            pin = plc.modules_w_pins[pin_idx]
+            pin.set_pos(x + pin.x_offset, y + pin.y_offset)
+
+    expected_size = plc.grid_col * plc.grid_row
+    if len(plc.H_routing_cong) != expected_size:
+        plc.V_routing_cong = [0] * expected_size
+        plc.H_routing_cong = [0] * expected_size
+        plc.V_macro_routing_cong = [0] * expected_size
+        plc.H_macro_routing_cong = [0] * expected_size
+
+    plc.FLAG_UPDATE_WIRELENGTH = True
+    plc.FLAG_UPDATE_DENSITY = True
+    plc.FLAG_UPDATE_CONGESTION = True
+
+
+def _proxy_cost_skip_congestion(placement, benchmark, plc):
+    """Wirelength + density only; skips the expensive congestion computation.
+
+    Replaces the previous skip_congestion=True kwarg into compute_proxy_cost,
+    which was a local extension not present in the shipping macro_place package.
+    Weights match compute_proxy_cost's defaults (wirelength=1.0, density=0.5).
+    """
+    _set_placement_on_plc(plc, placement, benchmark)
+    wl = plc.get_cost()
+    dens = plc.get_density_cost()
+    return {
+        "proxy_cost": 1.0 * wl + 0.5 * dens,
+        "wirelength_cost": wl,
+        "density_cost": dens,
+        "congestion_cost": 0.0,
+    }
+
+
 def _overlaps_any(px, py, pw, ph, placed_pos, placed_sizes):
     """Check if macro at (px,py) with size (pw,ph) overlaps any placed macro.
     Uses a small positive gap to prevent float-precision false overlaps."""
@@ -210,7 +273,7 @@ def density_equalize(
     grid_row = benchmark.grid_rows
 
     # Use fast eval (skip congestion) for DenEq — focuses on density improvement
-    best_cost = compute_cost_fn(best, benchmark, plc, skip_congestion=True)['proxy_cost']
+    best_cost = _proxy_cost_skip_congestion(best, benchmark, plc)['proxy_cost']
     start_time = time.time()
     improvements = 0
     evals = 0
@@ -324,7 +387,7 @@ def density_equalize(
                 trial = best.clone()
                 trial[idx, 0] = new_pos[0]
                 trial[idx, 1] = new_pos[1]
-                trial_cost = compute_cost_fn(trial, benchmark, plc, skip_congestion=True)['proxy_cost']
+                trial_cost = _proxy_cost_skip_congestion(trial, benchmark, plc)['proxy_cost']
                 evals += 1
 
                 if trial_cost < best_trial_cost:
@@ -403,7 +466,10 @@ def coordinate_descent_refine(
     sizes = benchmark.macro_sizes.cpu()
     fixed = benchmark.macro_fixed.cpu()
 
-    best_cost = compute_cost_fn(best, benchmark, plc, skip_congestion=skip_congestion)['proxy_cost']
+    if skip_congestion:
+        best_cost = _proxy_cost_skip_congestion(best, benchmark, plc)['proxy_cost']
+    else:
+        best_cost = compute_cost_fn(best, benchmark, plc)['proxy_cost']
 
     # Build net-to-macro adjacency
     macro_nets = [[] for _ in range(benchmark.num_macros)]
@@ -589,7 +655,10 @@ def coordinate_descent_refine(
                 trial[idx, 0] = new_pos[0]
                 trial[idx, 1] = new_pos[1]
 
-                trial_cost = compute_cost_fn(trial, benchmark, plc, skip_congestion=skip_congestion)['proxy_cost']
+                if skip_congestion:
+                    trial_cost = _proxy_cost_skip_congestion(trial, benchmark, plc)['proxy_cost']
+                else:
+                    trial_cost = compute_cost_fn(trial, benchmark, plc)['proxy_cost']
                 proxy_evals += 1
                 evals_done += 1
                 if trial_cost < best_trial_cost:
